@@ -1,0 +1,897 @@
+#include <ServoInput.h>
+#include <Servo.h>
+#include "math.h"
+#include "math.hpp"
+#include <Arduino.h>
+#include "constants.h"
+#include "I2Cdev.h"
+
+#include "MPU6050_6Axis_MotionApps20.h"
+// #include "MPU6050.h" // not necessary if using MotionApps include file
+
+// Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
+// is used in I2Cdev.h
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+#include "Wire.h"
+#endif
+
+#include <SPI.h>
+#include <SD.h>
+
+#define X 0
+#define Y 1
+#define Z 2
+
+
+//Used for counter for cascade PID loop
+#define OUTER_THROTTLE_FACTOR 1  // 1 = baseline, 2 = every other packet, etc.
+
+//Used for counter for cascade PID loop
+
+float dt = 0.010f; // this is some interval of time
+Quat DesiredAngPosition(0.993f, -0.025f, -0.01f, -0.1f); // 
+MPU6050 mpu;
+const int chipSelect = BUILTIN_SDCARD;
+File logFile;
+bool card_ready = false;
+const char* LOG_FILE = "log.csv";
+
+void setupSD(){
+  if (!SD.begin(BUILTIN_SDCARD)) { 
+    Serial.println("Failed to use the sd card please verify it works");
+    return; 
+  }
+
+  if (SD.exists(LOG_FILE)) {
+    SD.remove(LOG_FILE);
+  }
+
+  logFile = SD.open(LOG_FILE, FILE_WRITE);
+  if (!logFile) {
+    Serial.println("Failed to create the log file");
+    return;
+  }
+  logFile.println("W,X,Y,Z,throttle,roll,pitch,yaw,dt,time,desiredrate,actualrate,errorrate");
+ 
+  logFile.flush();
+
+
+  card_ready = true;
+
+}
+Vec3 globalDesiredRate(0.0f, 0.0f, 0.0f);
+Vec3 globaltorque(0.0f,0.0f,0.0f);
+//Class Definition:
+
+
+
+float throttle = 0.0f;
+
+
+void logDataPWM(Quat MotorPWM, Quat angularPosition, Vec3 angularVelocity) {
+    if (!card_ready) {
+      Serial.print("SD NOT READY");
+      return;
+    }
+
+    float roll = -atan2(2 * (angularPosition.w * angularPosition.x + angularPosition.y * angularPosition.z), 1 - 2 * (angularPosition.x * angularPosition.x + angularPosition.y * angularPosition.y))* (180.0f / M_PI);
+    float pitch = asin(clamp(2 * (angularPosition.w * angularPosition.y - angularPosition.z * angularPosition.x), -1.0f, 1.0f))* (180.0f / M_PI);
+    float yaw = -atan2(2 * (angularPosition.w * angularPosition.z + angularPosition.x * angularPosition.y), 1 - 2 * (angularPosition.y * angularPosition.y + angularPosition.z * angularPosition.z))* (180.0f / M_PI);
+
+    
+    // Guard against NaN
+    if (isnan(roll) || isnan(pitch) || isnan(yaw)) return;
+    
+
+    float time_in_seconds = micros() * 1e-6f;
+
+    logFile.print(MotorPWM.w);  logFile.print(",");
+    logFile.print(MotorPWM.x); logFile.print(",");
+    logFile.print(MotorPWM.y); logFile.print(",");
+    logFile.print(MotorPWM.z); logFile.print(",");
+    logFile.print(throttle); logFile.print(",");
+    logFile.print(roll);  logFile.print(",");
+    logFile.print(pitch); logFile.print(",");
+    logFile.print(yaw); logFile.print(",");
+    logFile.print(dt*1000); logFile.print(",");
+    logFile.print(time_in_seconds), logFile.print(",");
+    logFile.print(globalDesiredRate.y), logFile.print(",");
+    logFile.print(angularVelocity.y); logFile.print(",");
+    logFile.print(angularVelocity.y-globalDesiredRate.y); logFile.println();
+    
+    static int flushCount = 0;
+    if (++flushCount >= 10) {
+        logFile.flush();
+        flushCount = 0;
+    }
+}
+volatile bool mpuInterrupt = false;
+void dmpDataReady() {
+    mpuInterrupt = true;
+}
+
+//Temporary, for debug
+Quat integratedQuat(1.0f, 0.0f, 0.0f, 0.0f);  // global, starts at identity
+
+void integrateGyro(Vec3 angularVelocity, float dt) {
+    float wx = angularVelocity.x;
+    float wy = angularVelocity.y;
+    float wz = angularVelocity.z;
+
+    Quat &q = integratedQuat;
+
+    Quat qdot;
+    qdot.w = 0.5f * (-q.x*wx - q.y*wy - q.z*wz);
+    qdot.x = 0.5f * ( q.w*wx + q.y*wz - q.z*wy);
+    qdot.y = 0.5f * ( q.w*wy - q.x*wz + q.z*wx);
+    qdot.z = 0.5f * ( q.w*wz + q.x*wy - q.y*wx);
+
+    q.w += qdot.w * dt;
+    q.x += qdot.x * dt;
+    q.y += qdot.y * dt;
+    q.z += qdot.z * dt;
+    q = q.normalize();
+}
+
+//Temporary
+
+
+
+
+
+float clamp(float value, float minValue, float maxValue) {
+  return min(max(value, minValue), maxValue);
+}
+ 
+// Outer loop
+Vec3 AttitudeLoop(Quat D_quat, Quat CurrentOrientation ) {
+
+  Quat E_quat = CurrentOrientation.conjugate() * D_quat;
+  if (E_quat.w <0) { // Ensuring that the angle is between 0 and 180 degrees, as the error
+    // quaternion can be represented in two ways, and we want to use the
+    // one that represents the smaller angle.
+    E_quat *= -1;
+  }
+  float angle = 2.0f * acos(clamp(E_quat.w, -1.0f, 1.0f));
+  Vec3 axis(E_quat.x, E_quat.y, E_quat.z);
+  float sinHalf = sin(angle / 2.0f);
+
+  Vec3 E_vector_P;
+  if (sinHalf > 1e-6f)
+    E_vector_P = angle * axis / sinHalf;
+  else
+    E_vector_P = axis*2; // error is negligifalseble
+
+  Vec3 desiredRate = KP_att * E_vector_P;
+
+  // Clamp to safe maximum rate (e.g. 360 deg/s = 6.28 rad/s)
+
+  if (desiredRate.length() > maxRate) {
+    desiredRate = desiredRate.normalize() * maxRate;
+  }
+  //desiredRate.x =0;
+  //desiredRate.y =0;
+  //desiredRate.z =0;
+
+
+  return desiredRate;
+  
+}
+// Inner loop
+Vec3 RateLoop(Vec3 desiredRate, Vec3 actualRate, float dt, bool isON = false) {
+
+  static Vec3 rateErrorIntegral(0.0f);
+  static Vec3 prevRateError(0.0f);
+
+
+  const int N = 15;
+  static Vec3 errorBuffer[N];
+  static float timeBuffer[N];  // store dt for each sample
+  static int bufferIndex = 0;
+  static bool bufferFull = false;
+
+
+
+
+  Vec3 rateError = desiredRate - actualRate; // Finds rate error
+  //INTEGRATION
+  rateErrorIntegral += rateError * dt; // Integrates
+  // Clamp each axis independently
+  rateErrorIntegral.x = clamp(rateErrorIntegral.x, -deadband, deadband);
+  rateErrorIntegral.y = clamp(rateErrorIntegral.y, -deadband, deadband);
+  rateErrorIntegral.z = clamp(rateErrorIntegral.z, -deadband, deadband);
+
+  if (!isON) {
+    rateErrorIntegral = Vec3(0.0f);
+    bufferFull = false;
+    bufferIndex = 0;
+    for (int i = 0; i < N; i++) errorBuffer[i] = Vec3(0.0f);
+  }
+
+
+  //DERIVATION
+
+
+  // Store current sample
+  errorBuffer[bufferIndex] = rateError;
+  timeBuffer[bufferIndex] = dt;
+  bufferIndex = (bufferIndex + 1) % N;
+  if (!bufferFull && bufferIndex == 0) bufferFull = true;
+
+  Vec3 rateErrorDeriv(0.0f, 0.0f,0.0f);
+  if (bufferFull) {
+      // Oldest sample is at current bufferIndex (about to be overwritten)
+      int oldestIndex = bufferIndex;
+      int newestIndex = (bufferIndex - 1 + N) % N;
+      
+      // Total time span across all N samples
+      float totalDt = 0.0f;
+      for (int i = 0; i < N; i++) totalDt += timeBuffer[i];
+ 
+
+      // Derivative = change over full window
+      rateErrorDeriv = (errorBuffer[newestIndex] - errorBuffer[oldestIndex]) / totalDt;
+  }
+  // if buffer not full yet, rateErrorDeriv stays zero 
+
+
+  //TORQUE
+  Vec3 torque;
+  torque.x = (KP_rate * rateError.x + KI_rate * rateErrorIntegral.x +
+              KD_rate * rateErrorDeriv.x) *
+             KI[X];
+  torque.y = (KP_rate * rateError.y + KI_rate * rateErrorIntegral.y +
+              KD_rate * rateErrorDeriv.y) *
+             KI[Y];
+  torque.z = (KP_rate * rateError.z + KI_rate * rateErrorIntegral.z +
+              KD_rate * rateErrorDeriv.z) *
+             KI[Z];
+
+  return torque; // Returns desired torque
+}
+// This one goes through motor rotational velocities, has a cascade structure
+// and takes into account Gyroscopic effects in its physics simulation.
+//  seems to work, as long as KD is not too high... very unstable in that case
+Quat Hybrid_Stabloop(Quat D_quat, Vec3 &AngularVelocity, Quat &CurrentOrientation, float dt, bool isON) {
+
+
+  static int outerCounter = 0;
+  if (++outerCounter >= OUTER_THROTTLE_FACTOR) {
+      outerCounter = 0;
+      globalDesiredRate = AttitudeLoop(D_quat, CurrentOrientation);
+  }
+  // globalDesiredRate holds last value on skipped cycles
+
+
+
+  Vec3 torque = RateLoop(globalDesiredRate, AngularVelocity, dt, isON);
+  globaltorque = torque; //For logging to SD card
+  // --- Torque → Motor speeds (inverse mixer) ---
+  //float A = (m * g) /(((1.0 - 2.0 * (pow(CurrentOrientation.x, 2) + pow(CurrentOrientation.y, 2)))) *k); // total thrust term
+  float A = (m * g) / k; //(not taking into account maintaining altitude at different orientations)
+  float B = torque.x / (L * k);
+  float C = torque.y / (L * k);
+  float D = torque.z / b;
+
+  float W1 = (fmax(0.0f, A / 4 + B / 2 + D / 4));
+  float W2 = (fmax(0.0f, A / 4 + C / 2 - D / 4));
+  float W3 = (fmax(0.0f, A / 4 - B / 2 + D / 4));
+  float W4 = (fmax(0.0f, A / 4 - C / 2 - D / 4));
+
+  Quat MotorW(W1, W2, W3, W4);
+
+  return MotorW;
+}
+
+
+//Global
+//Physical Constants not Included in Function Definitions
+bool isON = false;
+
+
+
+
+
+//To tune the above constant, we should look at desired rate vs actual rate (not desired angular position vs desired angular position)
+
+
+
+//Servo motor communication
+ServoInputPin<12> r1;
+ServoInputPin<11> r2;
+ServoInputPin<10> r3;
+ServoInputPin<9> r4;
+
+
+Servo motor1;
+Servo motor2;
+Servo motor3;
+Servo motor4;
+
+
+float MaxMotorThrust = 2.156f;
+
+
+
+
+  //mpu VARIABLES
+  uint8_t devStatus; // return status after each device operation (0 = success, !0
+                   // = error)
+  uint8_t fifoBuffer[64]; // FIFO storage buffer
+
+void getAngularVelocity(int16_t *velocity, uint8_t *packet) {
+  mpu.dmpGetGyro(velocity, packet);
+}
+void getAngularPosition(Quaternion *quaternion, uint8_t *packet) {
+  mpu.dmpGetQuaternion(quaternion, packet);
+}
+
+
+float hoverW = ((m * g) / (4.0f * k)); 
+
+float mapMotorToPWM(float w) {
+    float correction = ((w / hoverW) - 1.0f);   // 0 at hover, [-1,1]
+    correction = clamp(correction, -1.0f, 1.0f);
+    return correction * 500.0f;                 
+}
+const int INTERRUPT_PIN = 15;
+void setup() {
+
+  Serial.begin(115200);
+  Wire.setSDA(18);
+  Wire.setSCL(19);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+  pinMode(INTERRUPT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_2000);
+
+  // verify connection
+  Serial.println(F("Testing device connections..."));
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful")
+                                      : F("MPU6050 connection failed"));
+
+  Serial.println(F("Initializing DMP..."));
+  mpu.CalibrateGyro(6);
+  mpu.CalibrateAccel(6);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_2000);
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);  // explicitly set ±2g
+  devStatus = mpu.dmpInitialize();
+
+
+    // supply your own gyro offsets here, scaled for min sensitivity
+  //mpu.setXGyroOffset(62);
+  //mpu.setYGyroOffset(30);
+  //mpu.setZGyroOffset(7);
+  //mpu.setXAccelOffset(-547);
+  //mpu.setYAccelOffset(493);
+  //mpu.setZAccelOffset(1293); // 1688 factory default for my test chip
+
+  // make sure it worked (returns 0 if so)
+  if (devStatus == 0) {
+    // Calibration Time: generate offsets and calibrate our MPU6050
+
+
+    //Comment in if we trust the automatic calibration
+    Serial.println();
+    mpu.PrintActiveOffsets();
+    // turn on the DMP, now that it's ready
+    Serial.println(F("Enabling DMP..."));
+
+    mpu.setRate(4);
+    mpu.setDMPEnabled(true);
+    delay(15000); //delay so that the DMP has time to actually calibrate because it seems to be taking about 15 seconds to do this for some unknown reason
+    
+  }
+
+  Serial.print("Calibration Done");
+
+  // capture converged orientation as setpoint
+  if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+
+      
+      Quaternion q;
+      mpu.dmpGetQuaternion(&q, fifoBuffer);
+      DesiredAngPosition = Quat(q.w, q.x, q.y, q.z).normalize();
+      Serial.print("Desired set: ");
+      Serial.print(DesiredAngPosition.w,4); Serial.print(" ");
+      Serial.print(DesiredAngPosition.x,4); Serial.print(" ");
+      Serial.print(DesiredAngPosition.y,4); Serial.print(" ");
+      Serial.println(DesiredAngPosition.z,4);
+      Serial.println("Desired Quat Initialized"); 
+
+      //0.9946 -0.0314 -0.0051 -0.0986
+      //0.9931 -0.0314 -0.0138 -0.1118
+      //0.9927 -0.0226 -0.0161 -0.1172
+      //0.9945 -0.0196 -0.0065 -0.1023
+
+      //Final approximation: 0.993, -0.025, -0.01, -0.1
+      
+      r1.attach(); // 
+      r2.attach();
+      r3.attach();
+      r4.attach();
+
+      motor1.attach(23);
+      motor2.attach(22);
+      motor3.attach(21);
+      motor4.attach(20);
+
+      motor1.writeMicroseconds(1000);
+      motor2.writeMicroseconds(1000);
+      motor3.writeMicroseconds(1000);
+      motor4.writeMicroseconds(1000);
+
+      delay(1000);
+
+      motor1.writeMicroseconds(2000);
+      motor2.writeMicroseconds(2000);
+      motor3.writeMicroseconds(2000);
+      motor4.writeMicroseconds(2000);
+
+      delay(1000);
+
+      motor1.writeMicroseconds(1000);
+      motor2.writeMicroseconds(1000);
+      motor3.writeMicroseconds(1000);
+      motor4.writeMicroseconds(1000);
+
+      Serial.println(" --- Motors Activation + Beebs");
+      setupSD();
+
+
+      
+
+
+
+
+  }
+
+  else {
+      Serial.println(" FAILURE: DESIRED QUAT NOT INITIALIZED & MOTOR NOT ATTACHED");
+  }
+
+  delay(4000);
+
+
+
+
+
+} 
+
+//DEBUGGING ________________________________________
+
+unsigned long lastRateLoopTime = 0;
+
+Vec3 getRawGyroRate() {
+  int16_t gx, gy, gz;
+  mpu.getRotation(&gx, &gy, &gz);
+  return Vec3((float)gx / 16.4f * DEG_TO_RAD + 0.1,
+              (float)gy / 16.4f * DEG_TO_RAD + 0.03,
+              (float)gz / 16.4f * DEG_TO_RAD );
+}
+//DEBUGGING _____________________________________________
+
+
+
+
+void loop() {
+
+
+  // put your main code here, to run repeatedly:
+  if (devStatus != 0) {
+      motor1.writeMicroseconds(1000);
+      motor2.writeMicroseconds(1000);
+      motor3.writeMicroseconds(1000);
+      motor4.writeMicroseconds(1000);
+      Serial.print("DEVSTATUS FALSE");
+      return;
+  }
+    
+
+  //Need to add start condition
+
+  
+
+
+
+  if (mpuInterrupt) { 
+        mpuInterrupt = false; // Reset the flag
+  // read a packet from FIFO
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+
+      static unsigned long lastPacketTime = micros(); //fixed does not reupdate in later loops through this line
+      unsigned long currentTime = micros();
+      dt = (currentTime - lastPacketTime) / 1000000.0f; 
+      lastPacketTime = currentTime; //updates for next loop
+      
+      if (dt <= 0.0f || dt>0.1f) {
+            dt = 0.01f; // Default to 10ms 
+      }
+
+
+      
+      Quaternion angPos;
+      // Angular
+      getAngularPosition(&angPos, fifoBuffer);
+      Quat angularPosition(angPos.w, angPos.x, angPos.y, angPos.z);
+      angularPosition = angularPosition.normalize();
+      int16_t angVel[3];
+      getAngularVelocity(angVel, fifoBuffer); //mpu.dmpgetgyro apparently already does the conversion from lsb to degree so I might not need the 16.4f
+      Vec3 angularVelocity((float) angVel[0] / (16.4f/16.4f) * DEG_TO_RAD, (float) angVel[1] / (16.4f/16.4f) * DEG_TO_RAD, (float) angVel[2]/ (16.4f/16.4f) * DEG_TO_RAD);
+      //integrateGyro(angularVelocity);
+
+      
+//Linear acceleration -- Claude
+      VectorInt16 accelRaw;
+      VectorInt16 accelRealRaw;  // gravity removed, body frame, library type
+      VectorFloat gravity;
+
+      mpu.dmpGetAccel(&accelRaw, fifoBuffer);
+      mpu.dmpGetGravity(&gravity, &angPos);
+      mpu.dmpGetLinearAccel(&accelRealRaw, &accelRaw, &gravity);
+
+      const float accelScale = 9.81f / 8192.0f;
+
+      // Convert gravity-removed body frame accel to Vec3
+      Vec3 accelReal(accelRealRaw.x * accelScale, 
+                    accelRealRaw.y * accelScale, 
+                    accelRealRaw.z * accelScale);
+
+      // Rotate to world frame
+      Quat accelQuat(0.0f, accelReal.x, accelReal.y, accelReal.z);
+      Quat rotated = angularPosition * accelQuat * angularPosition.conjugate();
+      Vec3 DroneLinearAcceleration(rotated.x, rotated.y, rotated.z-0.295); // Z axis is unstable, preferable don't use for position stabilization?
+
+      // Leaky velocity integrator
+      static Vec3 DroneLinearVelocity(0.0f);
+      const float decay = 1.0f;
+      DroneLinearVelocity = DroneLinearVelocity * decay + DroneLinearAcceleration * dt;
+
+      //------------------------
+
+
+
+
+      int MiddleR4 = 1454;
+      int MiddleR3 = 1496;
+      int MiddleR1 = 1451;
+
+      int RollCommand = r4.getPulse() - MiddleR4;
+      int PitchCommand =  r3.getPulse() - MiddleR3;
+      int YawCommand = r1.getPulse() - MiddleR1;
+
+      float MaxAngle = 10.0f*DEG_TO_RAD;
+      
+      float w;
+      float s;
+
+      Quat RollQuat;
+      Quat PitchQuat;
+      static Quat YawQuat;
+
+      int Give = 100;
+      int YawSpeed = 50;
+
+      //Remember
+      DesiredAngPosition = Quat(0.993f, -0.025f, -0.01f, -0.1f);
+
+      float XScale = 0.0f;
+      float YScale = 0.0f;
+
+
+      if (RollCommand >= Give || RollCommand<= -Give ) {
+
+
+        w = cos(RollCommand*(MaxAngle/500/2));
+        s = sin(RollCommand*(MaxAngle/500/2));
+
+        RollQuat = Quat(w, s, 0.0f, 0.0f );
+
+
+      }
+      //DroneLinearVelocity
+      else {
+        
+        w = cos(-DroneLinearVelocity.x*XScale*(MaxAngle/500/2));
+        s = sin(-DroneLinearVelocity.x*XScale*(MaxAngle/500/2));
+        RollQuat = Quat(w, s, 0.0f, 0.0f );
+      }
+      if (PitchCommand>= Give || PitchCommand<= -Give ) {
+
+        w = cos(PitchCommand*(MaxAngle/500/2));
+        s = sin(PitchCommand*(MaxAngle/500/2));
+        PitchQuat = Quat(w, 0.0f, s, 0.0f);
+
+
+
+
+      }
+      else {
+ 
+        
+        w = cos(-DroneLinearVelocity.y*YScale*(MaxAngle/500/2));
+        s = sin(-DroneLinearVelocity.y*YScale*(MaxAngle/500/2));
+        PitchQuat = Quat(w, 0.0f, s, 0.0f);        
+      }
+      
+      //Yaw is an exception, you hold it down and it rotates continuously
+
+      if (YawCommand>= Give || YawCommand<= -Give ) {
+
+
+        w = cos((float) YawSpeed*((float)YawCommand/500)*(MaxAngle/500/2));
+        s = sin((float) YawSpeed*((float)YawCommand/500)*(MaxAngle/500/2));
+        Quat tempYawQuat = Quat(w, 0.0f, 0.0f, s);
+        YawQuat = YawQuat*tempYawQuat;
+
+      }
+    Quat TotalInput =  RollQuat*PitchQuat*YawQuat;
+
+    DesiredAngPosition =  DesiredAngPosition*TotalInput;
+    DesiredAngPosition.normalize();
+
+
+
+
+
+
+
+
+
+    //Not actual quaternion but way to store motor W
+    Quat MotorW = Hybrid_Stabloop(DesiredAngPosition, angularVelocity, angularPosition, dt, isON);
+    // returns Quat MotorW(W1, W2, W3, W4);
+
+    Quat MotorPWM(
+      mapMotorToPWM(MotorW.w),
+      mapMotorToPWM(MotorW.x),
+      mapMotorToPWM(MotorW.y),
+      mapMotorToPWM(MotorW.z));
+    //Send Thurst(?) inputs to motors, assuming motor angular velocities are in rad/s
+
+    /* //Debug
+    Serial.print(r1.available()); Serial.print(" "); Serial.print(MotorPWM.w); Serial.print(" ");Serial.println(r1.getPulse());
+    Serial.print(r2.available());Serial.print(" "); Serial.print(MotorPWM.x);Serial.print(" ");Serial.println(r2.getPulse());
+    Serial.print(r3.available());Serial.print(" "); Serial.print(MotorPWM.y);Serial.print(" ");Serial.println(r3.getPulse());
+    Serial.print(r4.available());Serial.print(" "); Serial.print(MotorPWM.z);Serial.print(" ");Serial.println(r4.getPulse());
+    Serial.println("---------");
+    */
+
+
+
+
+
+
+
+    //  CONTROL CODE ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
+    //Control Constants
+
+    float MaxThrottle = 0.6f;
+    float HoverThrottle = 0.4174f;
+    
+    if (r2.getPulse()>=1300 && r3.getPulse()<=1600) { //stabilization included
+      isON = true;
+
+      
+
+      //throttle = min((r2.getPulse()-1300.0f)/700.0f, MaxThrottle); //Old
+
+      throttle = min(((r2.getPulse()-1500)/700)*((r2.getPulse()-1500)/700)*((r2.getPulse()-1500)/700) + HoverThrottle, MaxThrottle);
+
+
+      float basePWM = 1000.0f + throttle * 1000.0f; //when half throttle, is at 1500, correction can bring it up higher 
+      motor1.writeMicroseconds((int)clamp(basePWM + MotorPWM.w, 1000.0f, 2000.0f));
+      motor2.writeMicroseconds((int)clamp(basePWM + MotorPWM.x, 1000.0f, 2000.0f));
+      motor3.writeMicroseconds((int)clamp(basePWM + MotorPWM.z, 1000.0f, 2000.0f));
+      motor4.writeMicroseconds((int)clamp(basePWM + MotorPWM.y, 1000.0f, 2000.0f));
+
+
+      //Important 
+      //motor 1 is w
+      //motor 2 is x
+      //motor 3 is z
+      //motor 4 is y
+        
+    }
+
+
+    
+
+    else if (r2.getPulse()<1300) { //turn off
+
+      isON =false;
+      throttle = 0.0f;
+      motor1.writeMicroseconds(1000);
+      motor2.writeMicroseconds(1000);
+      motor3.writeMicroseconds(1000);
+      motor4.writeMicroseconds(1000);
+    }
+
+
+
+
+
+
+
+
+    /*
+    // === DEBUG OUTPUT ===========================================================================
+    Serial.println("--- MPU ---");
+    Serial.print("angPos w:"); Serial.print(angularPosition.w);
+    Serial.print(" x:"); Serial.print(angularPosition.x);
+    Serial.print(" y:"); Serial.print(angularPosition.y);
+    Serial.print(" z:"); Serial.println(angularPosition.z);
+
+    Serial.print("angVel x:"); Serial.print(angularVelocity.x);
+    Serial.print(" y:"); Serial.print(angularVelocity.y);
+    Serial.print(" z:"); Serial.println(angularVelocity.z);
+
+    Serial.println("--- MIXER ---");
+    Serial.print("MotorW w:"); Serial.print(MotorW.w);
+    Serial.print(" x:"); Serial.print(MotorW.x);
+    Serial.print(" y:"); Serial.print(MotorW.y);
+    Serial.print(" z:"); Serial.println(MotorW.z);
+
+    Serial.println("--- THRUST ---");
+    Serial.print("MotorT w:"); Serial.print(MotorT.w);
+    Serial.print(" x:"); Serial.print(MotorT.x);
+    Serial.print(" y:"); Serial.print(MotorT.y);
+    Serial.print(" z:"); Serial.println(MotorT.z);
+
+    Serial.println("--- PWM ---");
+    Serial.print("MotorPWM w:"); Serial.print(MotorPWM.w);
+    Serial.print(" x:"); Serial.print(MotorPWM.x);
+    Serial.print(" y:"); Serial.print(MotorPWM.y);
+    Serial.print(" z:"); Serial.println(MotorPWM.z);
+
+    Serial.println("--- RC ---");
+    Serial.print("r1 avail:"); Serial.print(r1.available());
+    Serial.print(" pulse:"); Serial.println(r1.getPulse());
+    Serial.print("r2 avail:"); Serial.print(r2.available());
+    Serial.print(" pulse:"); Serial.println(r2.getPulse());
+
+    Serial.println("==========");
+    */
+
+    //Serial.print(angularPosition.w); Serial.print(" ");
+    //Serial.print(angularPosition.x); Serial.print(" ");
+    //Serial.print(angularPosition.y); Serial.print(" ");
+    //Serial.println(angularPosition.z);
+    //Serial.print(MotorPWM.x);
+
+
+
+
+
+
+
+
+
+    
+    // float roll = -atan2(2 * (angularPosition.w * angularPosition.x + angularPosition.y * angularPosition.z), 1 - 2 * (angularPosition.x * angularPosition.x + angularPosition.y * angularPosition.y))* (180.0f / M_PI);
+    // float pitch = asin(clamp(2 * (angularPosition.w * angularPosition.y - angularPosition.z * angularPosition.x), -1.0f, 1.0f))* (180.0f / M_PI);
+    // float yaw = -atan2(2 * (angularPosition.w * angularPosition.z + angularPosition.x * angularPosition.y), 1 - 2 * (angularPosition.y * angularPosition.y + angularPosition.z * angularPosition.z))* (180.0f / M_PI);
+
+    // float pitchGyro = asin(clamp(2*(integratedQuat.w*integratedQuat.y 
+    //                   - integratedQuat.z*integratedQuat.x), -1.0f, 1.0f)) * (180.0f/M_PI);
+
+    
+    /*
+    Serial.print("DroneLinearAcceleration.x:");    Serial.print( DroneLinearAcceleration.x);    Serial.print(",");
+    Serial.print("DroneLinearAcceleration.y:");    Serial.print( DroneLinearAcceleration.y);    Serial.print(",");
+    Serial.print("DroneLinearAcceleration.z:");    Serial.print( DroneLinearAcceleration.z);    Serial.print(",");
+    Serial.print("DroneLinearVelocity.x:");    Serial.print(DroneLinearVelocity.x );    Serial.print(",");
+    Serial.print("DroneLinearVelocity.y:");    Serial.print(DroneLinearVelocity.y );    Serial.print(",");
+    Serial.print("DroneLinearVelocity.z:");    Serial.print(DroneLinearVelocity.z );    Serial.print(",");
+    */
+    /*
+    Serial.print("DesiredRateX:");
+    Serial.print(globalDesiredRate.x);
+    Serial.print(",");
+    Serial.print("DesiredRateY:");
+    Serial.print(globalDesiredRate.y);
+    Serial.print(","); */
+    /*Serial.print("DesiredRateZ:");
+    Serial.print(globalDesiredRate.z);
+    Serial.print(",");*/
+
+    
+
+
+    /*
+    Vec3 RawGyro = getRawGyroRate();
+
+    Serial.print("RawRoll:");
+    Serial.print(RawGyro.x);
+    Serial.print(',');
+    Serial.print("RawPitch:");
+    Serial.print(RawGyro.y);
+    Serial.print(',');
+    Serial.print("RawYaw:");
+    Serial.print(RawGyro.z);
+    Serial.print(',');  */
+    /*
+    Serial.print("DMPRollrate:");
+    Serial.print(angularVelocity.x);
+    Serial.print(',');
+    Serial.print("DMPPitchrate:");
+    Serial.print(angularVelocity.y);
+    Serial.print(','); */
+    /*Serial.print("DMPYawrate:");
+    Serial.print(angularVelocity.z);
+    Serial.print(',');*/
+    /*
+    Serial.print("TorqueX:");
+    Serial.print(globaltorque.x);
+    Serial.print(",");
+    Serial.print("TorqueY:");
+    Serial.print(globaltorque.y); */
+    /*Serial.print(",");
+    Serial.print("TorqueZ");
+    Serial.print(globaltorque.z);*/
+
+    //Serial.print("dt:");
+    //Serial.print(dt, 6);
+   
+
+    //Serial.println();
+
+
+    
+    
+    /*
+    Serial.print("Yaw:");
+    Serial.print(yaw);
+    Serial.print(',');
+
+    Serial.print("Pitch:");
+    Serial.print(pitch);
+    Serial.print(',');
+
+    Serial.print("Roll:");
+    Serial.println(roll); */
+    /*
+    Serial.print(',');
+    Serial.print("PitchGyro:"); Serial.println(pitchGyro); */
+    
+
+    //delay(100);
+
+    //Tested Desired Quaternion
+    //1.00 -0.05 -0.02 -0.03
+    //0.99 -0.02 -0.00 -0.10
+    //0.99 -0.03 -0.00 -0.10
+    //0.99 -0.03 -0.02 -0.11
+
+
+
+
+
+
+    
+    static int logCount = 0;
+    if (++logCount >= 5) {  
+        logDataPWM(MotorPWM, angularPosition, angularVelocity);
+
+        logCount = 0;
+    }
+    }
+    
+
+      //for debugging buffers
+    else {
+      Serial.println("NO BUFFER");
+    } 
+  }
+  //Note that it seems like the DMP has a fixed (hardcoded update time of 10 ms) 
+  //so my entire loop is mismatched, I must find dt based on time between packet updates 
+  //and not the time needed to run loop - FIXED
+}
+
